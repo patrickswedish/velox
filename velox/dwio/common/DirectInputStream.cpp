@@ -130,20 +130,39 @@ makeRanges(size_t size, memory::Allocation& data, std::string& tinyData) {
 }
 } // namespace
 
+void DirectInputStream::LoadedData::set(
+    LoadedBuffer&& loaded,
+    std::shared_ptr<void> load) {
+  owned = std::move(loaded.ownedData);
+  tiny = std::move(loaded.tinyData);
+  if (loaded.sharedData != nullptr) {
+    sharedPtr = loaded.sharedData;
+    sharedHolder = std::move(load);
+  }
+}
+
+bool DirectInputStream::LoadedData::valid() const {
+  return (static_cast<int>(sharedPtr != nullptr) +
+          static_cast<int>(owned.numPages() > 0) +
+          static_cast<int>(!tiny.empty())) <= 1;
+}
+
 void DirectInputStream::loadSync() {
   if (region_.length < DirectBufferedInput::kTinySize &&
-      data_.numPages() == 0) {
-    tinyData_.resize(region_.length);
+      loadedData_.owned.numPages() == 0) {
+    loadedData_.tiny.resize(region_.length);
   } else {
     const auto numPages =
         memory::AllocationTraits::numPages(loadedRegion_.length);
-    if (numPages > data_.numPages()) {
-      bufferedInput_->pool()->allocateNonContiguous(numPages, data_);
+    if (numPages > loadedData_.owned.numPages()) {
+      bufferedInput_->pool()->allocateNonContiguous(
+          numPages, loadedData_.owned);
     }
   }
 
   ioStats_->incRawBytesRead(loadedRegion_.length);
-  auto ranges = makeRanges(loadedRegion_.length, data_, tinyData_);
+  auto ranges =
+      makeRanges(loadedRegion_.length, loadedData_.owned, loadedData_.tiny);
   uint64_t usecs = 0;
   {
     MicrosecondWallTimer timer(&usecs);
@@ -186,7 +205,9 @@ void DirectInputStream::loadPosition() {
           waitFuture.wait();
         }
         loadedRegion_.offset = region_.offset;
-        loadedRegion_.length = load->getData(region_.offset, data_, tinyData_);
+        auto loaded = load->getData(region_.offset);
+        loadedRegion_.length = loaded.requestBytes;
+        loadedData_.set(std::move(loaded), load);
       }
       ioStats_->queryThreadIoLatencyUs().increment(loadUs);
       // DirectCoalescedLoad always reads from remote storage, not SSD.
@@ -203,6 +224,9 @@ void DirectInputStream::loadPosition() {
       region_.offset + offsetInRegion_ < loadedRegion_.offset ||
       region_.offset + offsetInRegion_ >=
           loadedRegion_.offset + loadedRegion_.length) {
+    // Outside the loaded range: drop the borrowed slice; loadSync() reloads
+    // below.
+    loadedData_.resetShared();
     loadedRegion_.offset = region_.offset + offsetInRegion_;
     loadedRegion_.length = (offsetInRegion_ + loadQuantum_ <= region_.length)
         ? loadQuantum_
@@ -213,17 +237,26 @@ void DirectInputStream::loadPosition() {
     loadSync();
   }
 
+  VELOX_DCHECK(
+      loadedData_.valid(),
+      "DirectInputStream has multiple live buffer representations");
+
   const auto offsetInData =
       offsetInRegion_ - (loadedRegion_.offset - region_.offset);
-  if (data_.numPages() == 0) {
-    run_ = reinterpret_cast<uint8_t*>(tinyData_.data());
-    runSize_ = tinyData_.size();
+  if (loadedData_.hasShared()) {
+    run_ = reinterpret_cast<uint8_t*>(const_cast<char*>(loadedData_.sharedPtr));
+    runSize_ = static_cast<uint32_t>(loadedRegion_.length);
+    offsetInRun_ = static_cast<int>(offsetInData);
+    offsetOfRun_ = 0;
+  } else if (loadedData_.owned.numPages() == 0) {
+    run_ = reinterpret_cast<uint8_t*>(loadedData_.tiny.data());
+    runSize_ = loadedData_.tiny.size();
     offsetInRun_ = offsetInData;
     offsetOfRun_ = 0;
   } else {
-    data_.findRun(offsetInData, &runIndex_, &offsetInRun_);
+    loadedData_.owned.findRun(offsetInData, &runIndex_, &offsetInRun_);
     offsetOfRun_ = offsetInData - offsetInRun_;
-    auto run = data_.runAt(runIndex_);
+    auto run = loadedData_.owned.runAt(runIndex_);
     run_ = run.data();
     runSize_ = memory::AllocationTraits::pageBytes(run.numPages());
     if (offsetOfRun_ + runSize_ > loadedRegion_.length) {
